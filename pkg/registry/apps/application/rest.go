@@ -50,6 +50,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	fluxshard "github.com/cozystack/cozystack/internal/fluxshardoperator"
+	"github.com/cozystack/cozystack/pkg/apis/apps/defaulting"
 	"github.com/cozystack/cozystack/pkg/apis/apps/presets"
 	appsv1alpha1 "github.com/cozystack/cozystack/pkg/apis/apps/v1alpha1"
 	"github.com/cozystack/cozystack/pkg/apis/apps/validation"
@@ -57,7 +58,6 @@ import (
 	"github.com/cozystack/cozystack/pkg/registry"
 	fieldfilter "github.com/cozystack/cozystack/pkg/registry/fields"
 	"github.com/cozystack/cozystack/pkg/registry/sorting"
-	internalapiext "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
 
@@ -110,26 +110,7 @@ type REST struct {
 // errors — callers can decide whether to log-and-continue (NewREST does)
 // or fail hard (tests do).
 func buildSpecSchema(raw string) (*structuralschema.Structural, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil, nil
-	}
-	var v1js apiextv1.JSONSchemaProps
-	if err := json.Unmarshal([]byte(raw), &v1js); err != nil {
-		return nil, fmt.Errorf("unmarshal v1 OpenAPI schema: %w", err)
-	}
-	scheme := runtime.NewScheme()
-	_ = internalapiext.AddToScheme(scheme)
-	_ = apiextv1.AddToScheme(scheme)
-	var ijs internalapiext.JSONSchemaProps
-	if err := scheme.Convert(&v1js, &ijs, nil); err != nil {
-		return nil, fmt.Errorf("convert v1->internal JSONSchemaProps: %w", err)
-	}
-	s, err := structuralschema.NewStructural(&ijs)
-	if err != nil {
-		return nil, fmt.Errorf("build structural schema: %w", err)
-	}
-	return s, nil
+	return defaulting.BuildSchema(raw)
 }
 
 // NewREST creates a new REST storage for Application with specific configuration
@@ -184,6 +165,8 @@ func (r *REST) Create(ctx context.Context, obj runtime.Object, createValidation 
 		return nil, fmt.Errorf("expected *appsv1alpha1.Application object, got %T", obj)
 	}
 
+	app = app.DeepCopy()
+
 	// Validate Application name format (DNS-1035 plus any kind-specific rules)
 	if errs := r.validateNameFormat(app.Name); len(errs) > 0 {
 		return nil, apierrors.NewInvalid(r.gvk.GroupKind(), app.Name, errs)
@@ -215,6 +198,16 @@ func (r *REST) Create(ctx context.Context, obj runtime.Object, createValidation 
 		return nil, apierrors.NewBadRequest(err.Error())
 	}
 
+	// Omission permits a chart default; explicit null suppresses it in Helm.
+	// Normalize only repairable fields before admission and persistence.
+	emptied, err := r.normalizeSpecNulls(app)
+	if err != nil {
+		return nil, apierrors.NewBadRequest(fmt.Sprintf("failed to normalize spec: %v", err))
+	}
+	if len(emptied) > 0 {
+		warning.AddWarning(ctx, "", emptyFieldsWarning(emptied))
+	}
+
 	r.warnLegacyPresets(app)
 	r.warnRemovedKubernetesFields(ctx, app)
 	r.warnRemovedUserPasswords(ctx, app)
@@ -228,7 +221,7 @@ func (r *REST) Create(ctx context.Context, obj runtime.Object, createValidation 
 	// this hook explicitly — unlike genericregistry.Store, which
 	// wires it automatically.
 	if createValidation != nil {
-		if err := createValidation(ctx, obj); err != nil {
+		if err := createValidation(ctx, app); err != nil {
 			return nil, err
 		}
 	}
@@ -533,20 +526,14 @@ func (r *REST) Update(ctx context.Context, name string, objInfo rest.UpdatedObje
 		return nil, false, err
 	}
 
-	// Validate the update if a validation function is provided
-	if updateValidation != nil {
-		if err := updateValidation(ctx, newObj, oldObj); err != nil {
-			klog.Errorf("Update validation failed for Application %s: %v", name, err)
-			return nil, false, err
-		}
-	}
-
 	// Assert the new object is of type Application
 	app, ok := newObj.(*appsv1alpha1.Application)
 	if !ok {
 		klog.Errorf("expected *appsv1alpha1.Application object, got %T", newObj)
 		return nil, false, fmt.Errorf("expected *appsv1alpha1.Application object, got %T", newObj)
 	}
+
+	app = app.DeepCopy()
 
 	// Note: name validation (DNS-1035 format + length) is intentionally skipped on
 	// Update because Kubernetes names are immutable. Validating here would block
@@ -555,6 +542,23 @@ func (r *REST) Update(ctx context.Context, name string, objInfo rest.UpdatedObje
 	// Validate that values don't contain reserved keys (starting with "_")
 	if err := validateNoInternalKeys(app.Spec); err != nil {
 		return nil, false, apierrors.NewBadRequest(err.Error())
+	}
+
+	// Admission must validate the same normalized values that will be stored.
+	emptied, err := r.normalizeSpecNulls(app)
+	if err != nil {
+		return nil, false, apierrors.NewBadRequest(fmt.Sprintf("failed to normalize spec: %v", err))
+	}
+	if len(emptied) > 0 {
+		warning.AddWarning(ctx, "", emptyFieldsWarning(emptied))
+	}
+
+	// Validate the update if a validation function is provided
+	if updateValidation != nil {
+		if err := updateValidation(ctx, app, oldObj); err != nil {
+			klog.Errorf("Update validation failed for Application %s: %v", name, err)
+			return nil, false, err
+		}
 	}
 
 	// Enforce hierarchical quota allocation on quota changes too: raising a
@@ -1550,13 +1554,23 @@ func (r *REST) convertHelmReleaseToApplication(ctx context.Context, hr *helmv2.H
 		},
 		Spec: filteredSpec,
 		Status: appsv1alpha1.ApplicationStatus{
-			Version: hr.Status.LastAttemptedRevision,
+			Version:                    hr.Status.LastAttemptedRevision,
+			InstallFailures:            hr.Status.InstallFailures,
+			UpgradeFailures:            hr.Status.UpgradeFailures,
+			LastAttemptedReleaseAction: string(hr.Status.LastAttemptedReleaseAction),
 		},
 	}
 
 	var conditions []metav1.Condition
 	for _, hrCondition := range hr.GetConditions() {
-		if hrCondition.Type == "Ready" || hrCondition.Type == "Released" {
+		// The Application carries no generation, so a client cannot tell a Stalled
+		// left over from the previous spec from one about the current spec. Compare
+		// the condition's own ObservedGeneration, not Status.ObservedGeneration: the
+		// question is which spec this condition describes.
+		if hrCondition.Type == "Stalled" && hrCondition.ObservedGeneration < hr.Generation {
+			continue
+		}
+		if hrCondition.Type == "Ready" || hrCondition.Type == "Released" || hrCondition.Type == "Stalled" {
 			conditions = append(conditions, metav1.Condition{
 				LastTransitionTime: hrCondition.LastTransitionTime,
 				Reason:             hrCondition.Reason,
@@ -1766,8 +1780,9 @@ func latestMonitorTime(m *cozyv1alpha1.WorkloadMonitor) metav1.Time {
 // from Spec.Interval — the previous coupling caused failed installs to
 // retry only every 5m, exceeding E2E budgets.
 func (r *REST) convertApplicationToHelmRelease(app *appsv1alpha1.Application) (*helmv2.HelmRelease, error) {
-	// Per-Application annotation overrides win over the global defaults
-	// (HelmReleaseInstallTimeout / HelmReleaseUpgradeTimeout):
+	// Kind-wide annotation overrides from this kind's ApplicationDefinition
+	// win over the global defaults (HelmReleaseInstallTimeout /
+	// HelmReleaseUpgradeTimeout):
 	//   - HelmInstallTimeout (release.cozystack.io/helm-install-timeout)
 	//     sets both Install.Timeout and Upgrade.Timeout;
 	//   - HelmUpgradeTimeout (release.cozystack.io/helm-upgrade-timeout)
@@ -2140,7 +2155,7 @@ const kubernetesKind = "Kubernetes"
 // upgraded cluster keeps them in its values until re-edited, and the adoption
 // migration deliberately leaves them in place rather than rewriting parent
 // values mid-upgrade -- but they no longer render anything on the Kubernetes CR.
-var removedKubernetesFields = []string{"nodeGroups", "nodeHealthCheck", "maxNodeProvisionTime"}
+var removedKubernetesFields = []string{"nodeGroups", "nodeHealthCheck", "maxNodeProvisionTime", "talos"}
 
 // warnRemovedKubernetesFields emits a client-facing admission warning for each
 // Phase 2-removed field still present in a Kubernetes CR's values, so an

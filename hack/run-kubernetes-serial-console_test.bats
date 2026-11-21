@@ -10,6 +10,8 @@
 # property, because a capture that grew an in-guest dependency would still look
 # healthy while being blind to exactly the runs it was written for.
 
+load test_helper
+
 kubectl_calls=/dev/null
 kubectl_pod_names=
 kubectl_list_rc=0
@@ -125,23 +127,6 @@ assert_file_contains() {
   esac
   printf 'expected %s to contain: %s\n' "${file}" "${needle}" >&2
   return 1
-}
-
-assert_file_lacks_pattern() {
-  local pattern="$1"
-  local file="$2"
-
-  # A missing file must fail rather than vacuously pass: awk exits 2 on an
-  # unreadable path, which is indistinguishable from "no line matched" once the
-  # status is folded into an if.
-  if [ ! -f "${file}" ]; then
-    printf 'expected %s to exist so it could be checked for: %s\n' "${file}" "${pattern}" >&2
-    return 1
-  fi
-  if awk -v pattern="${pattern}" '$0 ~ pattern { found = 1 } END { exit found ? 0 : 1 }' "${file}"; then
-    printf 'expected %s not to match: %s\n' "${file}" "${pattern}" >&2
-    return 1
-  fi
 }
 
 # The function under test redirects a command's stderr into a report file and

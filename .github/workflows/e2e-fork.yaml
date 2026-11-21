@@ -61,7 +61,8 @@ jobs:
   # base-repo PR file list — NOT from the presence/absence of an artifact the
   # fork's own build controls. Fail-closed if the fork build failed or the
   # pr-patch artifact is missing; green-and-stop only for a PR whose file list is
-  # entirely under docs/ (verified against the base-repo API).
+  # entirely under docs/ or the CI-only tools cmd/backport-batch/ and
+  # cmd/api-gate/ (verified against the base-repo API).
   resolve:
     name: Resolve fork PR
     # Only fork PRs: head_repository differs from the base repository. Same-repo
@@ -94,7 +95,7 @@ jobs:
       # pull-requests.yaml's e2e-report and docs/agents/e2e-testing.md §10.
       - name: Resolve fork PR and post "E2E Tests" status
         id: r
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           HEAD_SHA:   ${{ github.event.workflow_run.head_sha }}
           RUN_ID:     ${{ github.event.workflow_run.id }}
@@ -266,15 +267,21 @@ jobs:
               await decide('failure', 'PR file list hit the 3000-file API cap — cannot verify docs-only');
               return;
             }
+            // Paths with nothing to build and nothing for e2e to install: docs,
+            // and the CI-only Go tools no image builds. pull-requests.yaml's
+            // plan job answers the same question with the same prefixes, and
+            // hack/gate-concurrency-contract.bats holds the two lists equal.
+            //
             // A rename reports the NEW path in `filename` and the old one in
             // `previous_filename`. Checking only `filename` would read a
             // packages/… -> docs/… rename as docs-only, when it in fact removes
-            // a code path. BOTH sides must be under docs/ to count as docs-only.
-            const isDocs = p => typeof p === 'string' && p.startsWith('docs/');
-            const hasNonDocs = files.some(f =>
-              !isDocs(f.filename) || (f.previous_filename && !isDocs(f.previous_filename)));
-            if (!hasNonDocs) {
-              await decide('success', 'docs-only PR (verified via PR file list) — e2e not required');
+            // a code path. BOTH sides must be under these prefixes to count.
+            const noRuntimePrefixes = ['docs/', 'cmd/backport-batch/', 'cmd/api-gate/'];
+            const isNoRuntime = p => typeof p === 'string' && noRuntimePrefixes.some(x => p.startsWith(x));
+            const hasRuntime = files.some(f =>
+              !isNoRuntime(f.filename) || (f.previous_filename && !isNoRuntime(f.previous_filename)));
+            if (!hasRuntime) {
+              await decide('success', 'docs or CI-only tools (verified via PR file list) — e2e not required');
               return;
             }
 
@@ -359,7 +366,7 @@ jobs:
       # The base repo's own merge ref — safe to fetch, not fork-controlled code
       # execution. pr.patch is applied as DATA below; nothing from the tree runs.
       - name: Checkout PR merge ref
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/pull/${{ needs.resolve.outputs.pr_number }}/merge
           fetch-depth: 0
@@ -380,7 +387,7 @@ jobs:
           got="$(git rev-parse HEAD^2)"
           [ "$got" = "$EXPECTED_SHA" ] || { echo "::error::merge ref moved: HEAD^2=$got != resolved $EXPECTED_SHA"; exit 1; }
       - name: Download pr.patch
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: pr-patch
           path: _out/assets
@@ -389,7 +396,7 @@ jobs:
       - name: Apply pr.patch (reconstruct digest-pinned tree)
         run: git apply --3way _out/assets/pr.patch
       - name: Download OCI image archives
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: pr-oci-*
           merge-multiple: true
@@ -540,9 +547,10 @@ jobs:
     # per-node 8 CPU / 24 GiB in hack/e2e-compose.yaml is why the class is this
     # one. See the `e2e` job there for the full sizing note.
     runs-on: oracle-vm-32cpu-128gb-x86-64
-    # Sized above what the tenant-Kubernetes pair can spend on a failing run, and
-    # held to one figure across every lane that runs the suite.
-    timeout-minutes: 215
+    # Covers a green full suite. It does not cover a tenant-Kubernetes suite
+    # running into its node-join deadline, so a red there can end as a
+    # cancelled job. Held to one figure across every lane that runs the suite.
+    timeout-minutes: 265
     permissions:
       contents: read
       packages: read
@@ -557,7 +565,7 @@ jobs:
       SANDBOX_NAME: cozy-e2e-sandbox-fork-${{ github.run_id }}
     steps:
       - name: Checkout PR merge ref
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/pull/${{ needs.resolve.outputs.pr_number }}/merge
           fetch-depth: 0
@@ -585,7 +593,7 @@ jobs:
             rm -f "$yq_bin"
           fi
       - name: Download pr.patch
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: pr-patch
           path: _out/assets
@@ -640,29 +648,6 @@ jobs:
             echo "Attempt $attempt failed, retrying..."
             make -C packages/core/testing SANDBOX_NAME=$SANDBOX_NAME delete-cluster-container || true
           done
-      - name: Install Cozystack into sandbox
-        env:
-          COZY_APISERVER_ENDPOINT: https://192.168.123.11:6443
-          COZY_LINSTOR_DRBD_ENABLED: "false"
-          COZY_E2E_STORAGE_CLASS: local
-        run: |
-          if ! make -C packages/core/testing SANDBOX_NAME=$SANDBOX_NAME install-cozystack; then
-            echo "❌ Install failed (no retry — diagnostics below)"
-            echo "::group::HelmRelease status"
-            docker exec "$SANDBOX_NAME" sh -c 'kubectl get hr -A -o wide 2>&1 | tail -100' || true
-            echo "::endgroup::"
-            echo "::group::not-Ready HelmReleases"
-            docker exec "$SANDBOX_NAME" sh -c 'kubectl get hr -A --no-headers 2>/dev/null | awk "\$4 != \"True\" {print \$1\" \"\$2}"' \
-              | while read -r ns name; do
-                  echo "--- $ns/$name ---"
-                  docker exec "$SANDBOX_NAME" sh -c "kubectl describe hr '$name' -n '$ns' 2>&1 | tail -50" || true
-                done
-            echo "::endgroup::"
-            exit 1
-          fi
-      - name: Run OpenAPI tests
-        run: |
-          make -C packages/core/testing SANDBOX_NAME=$SANDBOX_NAME test-openapi
       # Test-Impact Analysis: select only the Chainsaw suites the PR diff
       # affects. The changed-file list is resolve's TRUSTED base-repo listFiles
       # (base64 through the job output), NOT a git diff on the fork-controlled
@@ -696,6 +681,38 @@ jobs:
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
+          # The complement of what the selected suites need, for a reduced
+          # install. An empty selection installs everything as before.
+          disabled=""
+          if [ -n "${apps}" ]; then
+            disabled="$(./hack/select-install.sh --disabled "${apps}")"
+          fi
+          echo "Disabled packages: ${disabled:-<none>}"
+          echo "disabled=${disabled}" >> "$GITHUB_OUTPUT"
+      - name: Install Cozystack into sandbox
+        env:
+          COZY_APISERVER_ENDPOINT: https://192.168.123.11:6443
+          COZY_LINSTOR_DRBD_ENABLED: "false"
+          COZY_E2E_STORAGE_CLASS: local
+          COZY_DISABLED_PACKAGES: ${{ steps.select.outputs.disabled }}
+        run: |
+          if ! make -C packages/core/testing SANDBOX_NAME=$SANDBOX_NAME install-cozystack; then
+            echo "❌ Install failed (no retry — diagnostics below)"
+            echo "::group::HelmRelease status"
+            docker exec "$SANDBOX_NAME" sh -c 'kubectl get hr -A -o wide 2>&1 | tail -100' || true
+            echo "::endgroup::"
+            echo "::group::not-Ready HelmReleases"
+            docker exec "$SANDBOX_NAME" sh -c 'kubectl get hr -A --no-headers 2>/dev/null | awk "\$4 != \"True\" {print \$1\" \"\$2}"' \
+              | while read -r ns name; do
+                  echo "--- $ns/$name ---"
+                  docker exec "$SANDBOX_NAME" sh -c "kubectl describe hr '$name' -n '$ns' 2>&1 | tail -50" || true
+                done
+            echo "::endgroup::"
+            exit 1
+          fi
+      - name: Run OpenAPI tests
+        run: |
+          make -C packages/core/testing SANDBOX_NAME=$SANDBOX_NAME test-openapi
       # Each suite runs once, one `chainsaw test` per suite directory, with no
       # retry loop (e2e-testing.md §1) — Chainsaw polls each assertion to its own
       # timeout. Full suite only when the full-e2e label skipped selection: if
@@ -745,7 +762,7 @@ jobs:
             _out/chainsaw-report.xml || true
       - name: Upload chainsaw report
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: chainsaw-report
           path: _out/chainsaw-report.xml
@@ -756,26 +773,11 @@ jobs:
           make -C packages/core/testing SANDBOX_NAME=$SANDBOX_NAME collect-report || true
       - name: Upload cozyreport.tgz
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cozyreport
           path: _out/cozyreport.tgz
           if-no-files-found: warn
-      # Both halves, and in this order: the compose project owns the nodes and
-      # the zpools outlive it.
-      - name: Tear down sandbox
-        if: always()
-        run: |
-          # Annotated, not fatal: same reasoning as the in-tree lane. The runner
-          # is discarded after the job, so a dirty host has no next tenant, and
-          # failing here would post the required "E2E Tests" status as a failure
-          # indistinguishable from a real one.
-          cleanup_rc=0
-          make -C packages/core/testing SANDBOX_NAME=$SANDBOX_NAME delete-cluster-container || cleanup_rc=$?
-          make -C packages/core/testing SANDBOX_NAME=$SANDBOX_NAME delete || true
-          if [ "$cleanup_rc" -ne 0 ]; then
-            echo "::error title=sandbox teardown::teardown exited $cleanup_rc; the host may hold a stale compose project or zpool"
-          fi
 
   # Flip the pending "E2E Tests" commit status posted by `resolve` to its
   # terminal state. Runs on failure too, so a failed publish or e2e turns the
@@ -799,7 +801,7 @@ jobs:
       statuses: write
     steps:
       - name: Report "E2E Tests" commit status
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PUBLISH_RESULT: ${{ needs.publish.result }}
           E2E_RESULT:     ${{ needs.e2e.result }}

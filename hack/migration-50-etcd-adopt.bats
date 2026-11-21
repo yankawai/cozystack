@@ -19,12 +19,15 @@
 #      always carrying the S3 backup destination, and stays at 0 after a
 #      successful adoption. Only a failed adoption restores it to 1.
 #
-# cozytest.sh's awk parser recognizes only @test blocks and a bare `}` on its
-# own line; there is no bats `run`/`$status`/`setup`. Assertions are direct
-# shell tests that exit non-zero on failure.
+# CI runs this file under Bats through `make bats-unit-tests`. It also remains
+# compatible with the legacy `hack/cozytest.sh` translator, whose awk parser
+# recognizes only @test blocks and a bare `}` on its own line. The tests avoid
+# `run`, `$status`, and setup() for that compatibility path.
 #
-# Run with: hack/cozytest.sh hack/migration-50-etcd-adopt.bats
+# Run with: bats hack/migration-50-etcd-adopt.bats
 # -----------------------------------------------------------------------------
+
+load test_helper
 
 FAKEBIN="$PWD/hack/testdata/migration-50"
 MIG="$PWD/packages/core/platform/images/migrations/migrations/50"
@@ -261,7 +264,7 @@ lineno() {
 @test "external S3 (no COSI at all) keeps the Strategy CR endpoint scheme verbatim" {
   prep
   # provisionBucket: false on a cluster with no SeaweedFS/COSI at all
-  # (docs/operations/backup-classes.md describes exactly this flip), so the
+  # (https://cozystack.io/docs/v1/operations/services/backup-classes/ describes exactly this flip), so the
   # BucketClaim CRD itself is absent and every claim query fails the way real
   # kubectl fails on an unknown resource type. That must classify as external
   # and must NOT abort the script under `set -euo pipefail`.
@@ -379,7 +382,7 @@ lineno() {
 @test "COSI with overridden bucket coordinates is still detected (no hardcoded names)" {
   prep
   # backupStorage.namespace / .bucketName are supported Package-CR overrides
-  # (docs/operations/backup-classes.md), and this hook cannot see chart values —
+  # (https://cozystack.io/docs/v1/operations/services/backup-classes/), and this hook cannot see chart values —
   # nothing plumbs them into the migration Job's env. So the claim may sit in any
   # namespace under any name. Keying on the COSI-assigned .status.bucketName,
   # which is what the projector republishes, makes the probe independent of both.

@@ -1,13 +1,15 @@
 #!/usr/bin/env bats
 # Unit tests for hack/build-matrix.sh — the CI build-matrix selector.
 #
-# Run via hack/cozytest.sh from the repo root (make bats-unit-tests); the
-# relative `hack/build-matrix.sh` calls below resolve against that cwd. A bats
-# setup() hook would be dead here — cozytest never invokes it — so the
-# repo-root cwd is supplied by the runner rather than a setup() cd.
+# Run from the repo root through `make bats-unit-tests`; the relative
+# `hack/build-matrix.sh` calls below resolve against that cwd. The file also
+# remains compatible with the legacy `hack/cozytest.sh` translator, which does
+# not invoke setup(), so neither runner depends on a setup() cd.
 #
 # Test-level EXIT traps replace Bats' own handler and hide failing TAP results.
 # Cleanup follows aborting assertions; see docs/agents/e2e-testing.md.
+
+load test_helper
 
 @test "no argument emits the full matrix" {
   out=$(hack/build-matrix.sh)
@@ -95,6 +97,23 @@
   rm -f "$tmp"
 }
 
+@test "the CI-only tools do not force the full matrix" {
+  tmp=$(mktemp)
+  # No image builds cmd/backport-batch or cmd/api-gate, so they select nothing
+  # and leave the rest of the diff to its own rules.
+  printf '%s\n' cmd/backport-batch/report_test.go cmd/api-gate/main.go > "$tmp"
+  out=$(hack/build-matrix.sh "$tmp")
+  [ "$out" = '[]' ]
+  printf '%s\n' cmd/backport-batch/main.go packages/apps/mariadb/Makefile > "$tmp"
+  out=$(hack/build-matrix.sh "$tmp")
+  [ "$out" = '["packages/apps/mariadb"]' ]
+  # Every other cmd/ directory is a shipped binary and still rebuilds all.
+  printf '%s\n' cmd/backport-batch/main.go cmd/cozystack-api/main.go > "$tmp"
+  out=$(hack/build-matrix.sh "$tmp")
+  [ "$out" = "$(hack/build-matrix.sh)" ]
+  rm -f "$tmp"
+}
+
 @test "a package with no image target selects nothing" {
   tmp=$(mktemp)
   # postgres ships no in-repo image build, so it is not a build unit.
@@ -108,7 +127,7 @@
   tmp=$(mktemp)
   echo "packages/system/seaweedfs/values.yaml" > "$tmp"
   out=$(hack/build-matrix.sh "$tmp")
-  [ "$out" = '["packages/system/objectstorage-controller"]' ]
+  [ "$out" = '["packages/system/seaweedfs","packages/system/objectstorage-controller"]' ]
   rm -f "$tmp"
 }
 
@@ -116,7 +135,23 @@
   tmp=$(mktemp)
   printf 'packages/system/seaweedfs/values.yaml\npackages/system/objectstorage-controller/values.yaml\n' > "$tmp"
   out=$(hack/build-matrix.sh "$tmp")
-  [ "$out" = '["packages/system/objectstorage-controller"]' ]
+  [ "$out" = '["packages/system/seaweedfs","packages/system/objectstorage-controller"]' ]
+  rm -f "$tmp"
+}
+
+@test "kubevirt-csi-node change fans out to the kubernetes build" {
+  tmp=$(mktemp)
+  echo "packages/system/kubevirt-csi-node/templates/deploy.yaml" > "$tmp"
+  out=$(hack/build-matrix.sh "$tmp")
+  [ "$out" = '["packages/apps/kubernetes"]' ]
+  rm -f "$tmp"
+}
+
+@test "kubevirt-csi-node change does not duplicate an already-selected kubernetes build" {
+  tmp=$(mktemp)
+  printf 'packages/system/kubevirt-csi-node/templates/deploy.yaml\npackages/apps/kubernetes/values.yaml\n' > "$tmp"
+  out=$(hack/build-matrix.sh "$tmp")
+  [ "$out" = '["packages/apps/kubernetes"]' ]
   rm -f "$tmp"
 }
 

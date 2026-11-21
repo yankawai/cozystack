@@ -58,7 +58,7 @@ type ConfigSpec struct {
 	// Users configuration map. Passwords are always auto-generated and stored in the `<release>-credentials` Secret; they cannot be set from values — read a user's password from that Secret. A `password` left over in values from before the field was removed is ignored by the render and draws an admission warning, but it is not inert on an upgraded release: the chart preserves whatever password is already in the Secret, which on the first upgrade is the value that was set before removal, so that value stays the live credential until it is rotated (dedicated rotation is tracked in cozystack/community#72). The live password lives only in the Secret.
 	// +kubebuilder:default:={}
 	Users map[string]User `json:"users,omitempty"`
-	// Databases configuration map.
+	// Databases configuration map. The PostgreSQL system databases `postgres`, `template0` and `template1` are refused.
 	// +kubebuilder:default:={}
 	Databases map[string]Database `json:"databases,omitempty"`
 	// Backup configuration.
@@ -124,7 +124,7 @@ type Backup struct {
 	// DEPRECATED. See `s3AccessKey`.
 	// +kubebuilder:default:=""
 	S3SecretKey string `json:"s3SecretKey,omitempty"`
-	// Legacy. Cron schedule (CNPG 6-field format) for the chart-emitted ScheduledBackup. Empty means no chart-managed schedule, which is the recommended setup when a `BackupClass` from `backups.cozystack.io` already drives backup orchestration. In the legacy chart-managed flow `spec.plugins` plus the barman-cloud ObjectStore is rendered when `backup.enabled=true` AND `useSystemBucket=false` AND `destinationPath` is non-empty AND inline-or-external creds are supplied; in the platform `useSystemBucket=true` flow the chart skips emitting `spec.plugins` and the CNPG driver SSA-applies the ObjectStore and patches `spec.plugins` onto the live Cluster at first BackupJob time.
+	// Legacy. Cron schedule for the chart-emitted ScheduledBackup, either a standard five-field cron such as `0 2 * * *` for every day at 02:00, or six fields with leading seconds such as `0 0 2 * * *` for the same time. Empty means no chart-managed schedule, which is the recommended setup when a `BackupClass` from `backups.cozystack.io` already drives backup orchestration. In the legacy chart-managed flow `spec.plugins` plus the barman-cloud ObjectStore is rendered when `backup.enabled=true` AND `useSystemBucket=false` AND `destinationPath` is non-empty AND inline-or-external creds are supplied; in the platform `useSystemBucket=true` flow the chart skips emitting `spec.plugins` and the CNPG driver SSA-applies the ObjectStore and patches `spec.plugins` onto the live Cluster at first BackupJob time.
 	// +kubebuilder:default:=""
 	Schedule string `json:"schedule,omitempty"`
 	// Opt-in: when true, the chart-emitted `<release>-s3-creds` Secret is skipped AND `spec.plugins` (plus the barman-cloud ObjectStore) is left UNSET in the chart-rendered Cluster — the cozy-default BackupClass driver SSA-applies an ObjectStore (carrying destinationPath/endpointURL/credentials) and patches `spec.plugins` on the live Cluster when the first BackupJob runs. Consequence: plugin WAL archiving is NOT active until that first BackupJob fires; WAL accumulates on the PVC in the meantime, so fire an ad-hoc BackupJob immediately after enabling the flag on existing releases. Use together with the platform `cozy-default` BackupClass — tenants do not need to fill `s3AccessKey`/`s3SecretKey` or `destinationPath`/`endpointURL`. The destination path automatically scopes to `s3://cozy-backups/<namespace>/<release>/`.
@@ -213,8 +213,10 @@ type S3CredentialsSecret struct {
 }
 
 type TLS struct {
-	// Tri-state switch controlling whether the chart injects the external hostname into the operator-managed CNPG cert via spec.certificates.serverAltDNSNames. When omitted, the chart injects the SAN if `external: true` and skips it otherwise. Set explicitly to `true` to inject regardless of `external` (no-op when `external: false` since there is no external hostname to add). Set to `false` to skip injection. Note that CNPG keeps its built-in TLS on the wire regardless of this flag — this toggle only controls the chart-side SAN injection; to disable PostgreSQL TLS entirely set `postgresql.parameters.ssl = "off"` at the CNPG layer.
+	// Tri-state switch controlling whether the chart injects the external hostnames into the operator-managed CNPG cert via spec.certificates.serverAltDNSNames. When omitted, the chart injects them if `external: true` and skips them otherwise. Set explicitly to `true` to inject regardless of `external` (no-op when `external: false` since there is no external hostname to add). Set to `false` to skip injection. Note that CNPG keeps its built-in TLS on the wire regardless of this flag — this toggle only controls the chart-side SAN injection; to disable PostgreSQL TLS entirely set `postgresql.parameters.ssl = "off"` at the CNPG layer.
 	Enabled *bool `json:"enabled,omitempty"`
+	// Tri-state switch controlling whether the server refuses sessions that are not encrypted. When omitted, it is on if `external: true` and off otherwise. When on, the chart renders `spec.postgresql.pg_hba` with `hostssl all all all scram-sha-256` (`md5` on PostgreSQL 13, matching CloudNativePG's default rule) followed by `host all all all reject`, so a client that connects with `sslmode=disable` is refused instead of getting a plaintext session; in-cluster clients are held to the same rule, since the pod network cannot be told apart from an external client. Set to `false` to keep accepting plaintext sessions on an external instance, or to `true` to require TLS on an in-cluster one. Rendering fails if `postgresql.parameters.ssl` is off while this is in effect.
+	Required *bool `json:"required,omitempty"`
 }
 
 type User struct {

@@ -25,14 +25,17 @@
 # its budget inside a Pod it creates, and shrinking that budget would change
 # which image factory the happy path picks.
 #
-# cozytest.sh's awk parser ends an @test block at the first bare closing brace,
-# so command mocks stay at top level, and there is no bats `run`/`$status`:
-# assertions are direct shell tests that exit non-zero on failure. EXIT-trap
+# CI runs this file under Bats through `make bats-unit-tests`. It also remains
+# compatible with the legacy `hack/cozytest.sh` translator, which ends an @test
+# block at the first bare closing brace, so command mocks stay at top level and
+# assertions avoid `run` and `$status`. EXIT-trap
 # cleanup is banned in hack/*.bats and frozen by a guard in hack/cozyreport.bats,
 # so each test removes its own temp dir on its last line.
 #
-# Run with: hack/cozytest.sh hack/run-kubernetes-node-join_test.bats
+# Run with: bats hack/run-kubernetes-node-join_test.bats
 # -----------------------------------------------------------------------------
+
+load test_helper
 
 kubectl_calls=/dev/null
 unbounded_calls=/dev/null
@@ -199,6 +202,26 @@ no_sandbox_talosconfig() {
   export TALOSCONFIG="$1/talosconfig-absent"
 }
 
+# A fresh `bash -c` sees none of the function mocks above, and `timeout` execs
+# its argument, so a read can reach the real kubectl past a stub the subshell
+# does define. These executables go first on that subshell's PATH and record
+# every call into $1/exec.calls, so a test can fail on a call nothing stubbed.
+stage_exec_recorders() {
+  mkdir -p "$1/exec-bin"
+  for c in kubectl talosctl; do
+    printf '#!/bin/sh\necho "%s $*" >>"%s/exec.calls"\nexit 1\n' "$c" "$1" >"$1/exec-bin/$c"
+    chmod +x "$1/exec-bin/$c"
+  done
+}
+
+assert_no_exec_calls() {
+  if [ -s "$1/exec.calls" ]; then
+    echo "FAIL: a cluster client was executed past its stub:" >&2
+    cat "$1/exec.calls" >&2
+    false
+  fi
+}
+
 # The block calls collectors that have their own suites and their own bounds.
 # The ones here are stubbed everywhere; the ones under stub_gated_collectors
 # below are stubbed only where the test is about the budget rather than the
@@ -275,36 +298,6 @@ assert_file_contains() {
   esac
   printf 'expected %s to contain: %s\n' "${file}" "${needle}" >&2
   return 1
-}
-
-# The sibling suites' three-way split, and here for the same reason. A bare
-# `! grep -q` succeeds on a file that does not exist, which is
-# indistinguishable from the file existing without the pattern; and awk exits 1
-# for "no line matched" and 2 for "I could not evaluate this", so folding those
-# together lets a broken matcher satisfy a negative assertion. A positive
-# assertion fails loudly when its matcher breaks and gets fixed; this one would
-# go green and stay green.
-assert_file_lacks_pattern() {
-  local pattern="$1"
-  local file="$2"
-  local _rc=0
-
-  if [ ! -f "${file}" ]; then
-    printf 'expected %s to exist so it could be checked for: %s\n' "${file}" "${pattern}" >&2
-    return 1
-  fi
-  awk -v pattern="${pattern}" '$0 ~ pattern { found = 1 } END { exit found ? 0 : 1 }' "${file}" || _rc=$?
-  case "${_rc}" in
-    0)
-      printf 'expected %s not to match: %s\n' "${file}" "${pattern}" >&2
-      return 1
-      ;;
-    1) return 0 ;;
-    *)
-      printf 'awk could not evaluate pattern %s against %s\n' "${pattern}" "${file}" >&2
-      return 1
-      ;;
-  esac
 }
 
 # The ceilings both budget guards below price their sums from, read out of the
@@ -933,6 +926,7 @@ read_cost_inputs() {
   # stops existing. The read bound becomes `--request-timeout=2ms`.
   tmp=$(mktemp -d)
   use_temp_report_dir "$tmp"
+  stage_exec_recorders "$tmp"
   # 0480 alongside 8m: all digits, so a digits-only check passes it, and then the
   # budget dies in `$(( ))` as octal exactly as the suffix does while the read bound
   # quietly becomes 480 seconds. Same arm the previous-logs collector already has.
@@ -948,7 +942,7 @@ read_cost_inputs() {
    # indistinguishable from unset, so it takes the default silently and correctly;
    # the empty-string hazard lives on the post-source path and is checked there.
    for bad in 8m 0480; do
-    out=$(env "$knob=$bad" bash -c '
+    out=$(env "$knob=$bad" PATH="$tmp/exec-bin:$PATH" bash -c '
       set -eu
       . hack/e2e-chainsaw/_lib/run-kubernetes.sh
       cozy_report_guest_console_wedge() { :; }
@@ -961,6 +955,7 @@ read_cost_inputs() {
       cozy_capture_runner_kernel_cpu_time() { :; }
       cozy_capture_sandbox_qemu_thread_cpu() { :; }
       cozy_capture_runner_canary() { :; }
+      timeout() { :; }
       kubectl() { :; }
       cozy_report_node_join_failure test-latest-version
     ' 2>&1) || true
@@ -979,6 +974,7 @@ read_cost_inputs() {
     fi
    done
   done
+  assert_no_exec_calls "$tmp"
   rm -rf "$tmp"
 }
 
@@ -1986,7 +1982,8 @@ EOF
   fi
   tmp=$(mktemp -d)
   use_temp_report_dir "$tmp"
-  bash -c '
+  stage_exec_recorders "$tmp"
+  PATH="$tmp/exec-bin:$PATH" bash -c '
     set -eu
     . hack/e2e-chainsaw/_lib/run-kubernetes.sh
     cozy_report_guest_console_wedge() { :; }
@@ -2000,6 +1997,7 @@ EOF
     cozy_capture_sandbox_qemu_thread_cpu() { :; }
     cozy_capture_runner_canary() { :; }
     cozy_capture_tenant_worker_block_io() { :; }
+    timeout() { :; }
     kubectl() { :; }
     COZY_DIAG_PHASE_BUDGET=0
     cozy_report_node_join_failure test-latest-version
@@ -2013,6 +2011,7 @@ EOF
   # Not vacuous: the phase really did decline, so the run above walked the path
   # the assertion is about rather than returning early somewhere else.
   assert_file_contains 'not collected' "$tmp/out"
+  assert_no_exec_calls "$tmp"
   rm -rf "$tmp"
 }
 

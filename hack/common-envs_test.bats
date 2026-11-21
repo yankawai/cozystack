@@ -13,13 +13,15 @@
 # (a two-`--tag` buildx call that put two manifests in one OCI archive) — plus a
 # plain image-tags package (cozystack-controller) as the happy path.
 #
-# Run via hack/cozytest.sh from the repo root (make bats-unit-tests): the
-# relative `make -C packages/...` calls resolve against that cwd. This is NOT
-# real bats — no run/$status/$output/setup(); use plain $(...) capture + grep,
-# and the build-matrix_test.bats `if grep -q …; then echo FAIL; false; fi`
-# negation idiom (cozytest runs each @test under `set -e`, which suppresses any
-# command whose status is inverted with `!`, so a regression would silently pass
-# a `! grep`).
+# Run from the repo root through `make bats-unit-tests`; the relative
+# `make -C packages/...` calls resolve against that cwd. The file also remains
+# compatible with the legacy `hack/cozytest.sh` translator, so it avoids
+# run/$status/$output/setup() and uses plain $(...) capture plus grep and the
+# build-matrix_test.bats `if grep -q …; then echo FAIL; false; fi`
+# negation idiom (cozytest runs each @test under `set -e`, which suppresses a
+# bare `!`-negated pipeline, so a regression would silently pass a `! grep`).
+
+load test_helper
 
 @test "cozystack-controller exports one OCI archive and never pushes under OCI_EXPORT_DIR" {
   out=$(make -n -C packages/system/cozystack-controller image OCI_EXPORT_DIR=/tmp/ocitest IMAGE_TAG=pr-1-abc BUILDER=b)
@@ -140,6 +142,39 @@
   echo "$out" | grep -q -- '--push=1 --load=0' || { echo "FAIL: empty PUSH/LOAD reach buildx as empty flags"; false; }
   out=$(PUSH= LOAD=1 make -n -C packages/system/cozystack-controller image IMAGE_TAG=pr-1-abc COZYSTACK_VERSION=0 BUILDER=b)
   echo "$out" | grep -q -- '--push=0 --load=1'
+}
+
+@test "SBOM=1 attaches an SPDX attestation from a scanner pinned by digest and a mode=min provenance, and the default builds none" {
+  # An image built with an attestation is an index, not a plain manifest, which
+  # the stitch and the gate have to read, so it stays off unless a build asks.
+  # --sbom=true would pull the scanner by a floating tag. Provenance rides the
+  # same attestation manifest; mode=max would write build arguments into it.
+  out=$(make -n -C packages/system/cozystack-controller image IMAGE_TAG=pr-1-abc COZYSTACK_VERSION=0 BUILDER=b)
+  if echo "$out" | grep -q -- '--attest\|--sbom'; then echo "FAIL: an attestation without SBOM=1"; false; fi
+  echo "$out" | grep -q -- '--provenance=false' || { echo "FAIL: provenance not switched off without SBOM=1"; false; }
+  out=$(make -n -C packages/system/cozystack-controller image IMAGE_TAG=pr-1-abc COZYSTACK_VERSION=0 BUILDER=b SBOM=1)
+  echo "$out" | grep -qE -- '--attest type=sbom,generator=[^ ]+@sha256:[0-9a-f]{64} ' || { echo "FAIL: no digest-pinned scanner"; false; }
+  if echo "$out" | grep -q -- '--sbom'; then echo "FAIL: --sbom=true pulls a floating scanner tag"; false; fi
+  echo "$out" | grep -q -- '--attest type=provenance,mode=min' || { echo "FAIL: no mode=min provenance beside the SBOM"; false; }
+  if echo "$out" | grep -q -- '--provenance=false'; then echo "FAIL: --provenance=false cancels the provenance attestation"; false; fi
+  if echo "$out" | grep -qE -- 'provenance,mode=max|--provenance=true'; then echo "FAIL: full provenance would carry build arguments"; false; fi
+  # The environment reaches buildx as well, which is how the release workflow sets it.
+  out=$(SBOM=1 make -n -C packages/system/cozystack-controller image IMAGE_TAG=pr-1-abc COZYSTACK_VERSION=0 BUILDER=b)
+  echo "$out" | grep -q -- '--attest type=sbom,'
+}
+
+@test "Renovate moves the SBOM scanner pin, tag and digest together" {
+  # Renovate reaches hack/common-envs.mk only through a custom manager, and a
+  # reformatted SBOM_SCANNER line drops out of its regexp without a word, so the
+  # pin would stay on its syft. The named groups are Renovate's: depName,
+  # currentValue and currentDigest, in that order.
+  re=$(jq -r '.customManagers[] | select(any(.managerFilePatterns[]; test("common-envs"))) | .matchStrings[0]' .github/renovate.json)
+  [ -n "$re" ] || { echo "FAIL: no Renovate custom manager covers hack/common-envs.mk"; false; }
+  ere=$(printf '%s' "$re" | sed -E 's/\(\?<[A-Za-z]+>/(/g')
+  pin=$(sed -nE "s#^.*${ere}.*\$#\\1:\\2@\\3#p" hack/common-envs.mk)
+  [ -n "$pin" ] || { echo "FAIL: the manager matches no SBOM_SCANNER line in hack/common-envs.mk"; false; }
+  out=$(make -n -C packages/system/cozystack-controller image IMAGE_TAG=pr-1-abc COZYSTACK_VERSION=0 BUILDER=b SBOM=1)
+  echo "$out" | grep -qF -- "generator=${pin} " || { echo "FAIL: the manager reads ${pin}, not the scanner the build passes"; false; }
 }
 
 @test "talos publishes nothing to the registry with PUSH=0" {

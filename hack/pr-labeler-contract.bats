@@ -11,6 +11,8 @@
 # required, not optional: a suite that skips when the runtime is missing goes
 # green having run nothing.
 
+load test_helper
+
 REPO_ROOT="$(cd "$(dirname "${BATS_TEST_FILENAME:-$0}")/.." && pwd)"
 WF="$REPO_ROOT/.github/workflows/pr-labeler.yaml"
 LABELS="$REPO_ROOT/.github/labels.yml"
@@ -21,9 +23,12 @@ need_node() {
   return 1
 }
 
-# The `script: |` block, de-indented to plain JavaScript.
+# The `script: |` block, de-indented to plain JavaScript. The block ends at the
+# first non-blank line indented less than its body, where the next job starts.
 extract_script() {
-  awk 'f { print substr($0, 13) } /^ +script: \|$/ { f = 1 }' "$WF" > "$1"
+  awk 'f && length($0) && substr($0, 1, 12) != "            " { exit }
+       f { print substr($0, 13) }
+       /^ +script: \|$/ { f = 1 }' "$WF" > "$1"
   [ -s "$1" ]
 }
 

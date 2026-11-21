@@ -100,7 +100,8 @@ flavor: postgresql
 ##
 
 ## @typedef {struct} TLS - TLS configuration for PostgreSQL server connections.
-## @field {*bool} enabled - Tri-state switch controlling whether the chart injects the external hostname into the operator-managed CNPG cert via spec.certificates.serverAltDNSNames. When omitted, the chart injects the SAN if `external: true` and skips it otherwise. Set explicitly to `true` to inject regardless of `external` (no-op when `external: false` since there is no external hostname to add). Set to `false` to skip injection. Note that CNPG keeps its built-in TLS on the wire regardless of this flag — this toggle only controls the chart-side SAN injection; to disable PostgreSQL TLS entirely set `postgresql.parameters.ssl = "off"` at the CNPG layer.
+## @field {*bool} enabled - Tri-state switch controlling whether the chart injects the external hostnames into the operator-managed CNPG cert via spec.certificates.serverAltDNSNames. When omitted, the chart injects them if `external: true` and skips them otherwise. Set explicitly to `true` to inject regardless of `external` (no-op when `external: false` since there is no external hostname to add). Set to `false` to skip injection. Note that CNPG keeps its built-in TLS on the wire regardless of this flag — this toggle only controls the chart-side SAN injection; to disable PostgreSQL TLS entirely set `postgresql.parameters.ssl = "off"` at the CNPG layer.
+## @field {*bool} required - Tri-state switch controlling whether the server refuses sessions that are not encrypted. When omitted, it is on if `external: true` and off otherwise. When on, the chart renders `spec.postgresql.pg_hba` with `hostssl all all all scram-sha-256` (`md5` on PostgreSQL 13, matching CloudNativePG's default rule) followed by `host all all all reject`, so a client that connects with `sslmode=disable` is refused instead of getting a plaintext session; in-cluster clients are held to the same rule, since the pod network cannot be told apart from an external client. Set to `false` to keep accepting plaintext sessions on an external instance, or to `true` to require TLS on an in-cluster one. Rendering fails if `postgresql.parameters.ssl` is off while this is in effect.
 
 ## @param {TLS} tls - TLS configuration for server connections.
 tls: {}
@@ -148,6 +149,11 @@ postgresql:
 ## NOTE: Some parameters require pod restart (not just reload):
 ##   shared_buffers, max_connections, max_prepared_transactions,
 ##   wal_buffers, max_wal_senders
+##
+## When shared_buffers is not set and the memory limit is below 512Mi, the
+## chart sets it to a quarter of the limit with a 16MB floor, capped at the
+## memory request rounded down to whole MiB. Larger limits keep the
+## PostgreSQL default of 128MB.
 
 ##
 ## @section Quorum-based synchronous replication
@@ -197,7 +203,7 @@ quorum:
 ## CNPG webhook rejects under quorum, and — worse — under server-side apply the phase-2
 ## omit prunes the field whenever KEDA has not yet written /scale (e.g. a cluster idle at
 ## its floor), collapsing it to 1 and decommissioning every replica PVC (see community
-## design proposal §Upgrade "Implementation update 2026-09-02"; validated live on dev9).
+## design proposal §Upgrade "Implementation update 2026-09-02"; validated live on a test cluster).
 ## Seeding max(replicas, effectiveMin) — rather than effectiveMin alone — keeps the active
 ## branch equal to the disabled/dryRun/transition branch (which renders `instances:
 ## replicas`) whenever `replicas` sits at or above the floor, so enabling, dry-running, or
@@ -281,7 +287,7 @@ users: {}
 ## @field {DatabaseRoles} [roles] - Roles assigned to users.
 ## @field {[]string} [extensions] - List of enabled PostgreSQL extensions.
 
-## @param {map[string]Database} databases - Databases configuration map.
+## @param {map[string]Database} databases - Databases configuration map. The PostgreSQL system databases `postgres`, `template0` and `template1` are refused.
 databases: {}
 ## Example:
 ## databases:
@@ -315,7 +321,7 @@ databases: {}
 ## @typedef {struct} Backup - Backup configuration.
 ## @field {bool} enabled - Enable regular backups.
 ## @field {bool} [useSystemBucket] - Opt-in: when true, the chart-emitted `<release>-s3-creds` Secret is skipped AND `spec.plugins` (plus the barman-cloud ObjectStore) is left UNSET in the chart-rendered Cluster — the cozy-default BackupClass driver SSA-applies an ObjectStore (carrying destinationPath/endpointURL/credentials) and patches `spec.plugins` on the live Cluster when the first BackupJob runs. Consequence: plugin WAL archiving is NOT active until that first BackupJob fires; WAL accumulates on the PVC in the meantime, so fire an ad-hoc BackupJob immediately after enabling the flag on existing releases. Use together with the platform `cozy-default` BackupClass — tenants do not need to fill `s3AccessKey`/`s3SecretKey` or `destinationPath`/`endpointURL`. The destination path automatically scopes to `s3://cozy-backups/<namespace>/<release>/`.
-## @field {string} [schedule] - Legacy. Cron schedule (CNPG 6-field format) for the chart-emitted ScheduledBackup. Empty means no chart-managed schedule, which is the recommended setup when a `BackupClass` from `backups.cozystack.io` already drives backup orchestration. In the legacy chart-managed flow `spec.plugins` plus the barman-cloud ObjectStore is rendered when `backup.enabled=true` AND `useSystemBucket=false` AND `destinationPath` is non-empty AND inline-or-external creds are supplied; in the platform `useSystemBucket=true` flow the chart skips emitting `spec.plugins` and the CNPG driver SSA-applies the ObjectStore and patches `spec.plugins` onto the live Cluster at first BackupJob time.
+## @field {string} [schedule] - Legacy. Cron schedule for the chart-emitted ScheduledBackup, either a standard five-field cron such as `0 2 * * *` for every day at 02:00, or six fields with leading seconds such as `0 0 2 * * *` for the same time. Empty means no chart-managed schedule, which is the recommended setup when a `BackupClass` from `backups.cozystack.io` already drives backup orchestration. In the legacy chart-managed flow `spec.plugins` plus the barman-cloud ObjectStore is rendered when `backup.enabled=true` AND `useSystemBucket=false` AND `destinationPath` is non-empty AND inline-or-external creds are supplied; in the platform `useSystemBucket=true` flow the chart skips emitting `spec.plugins` and the CNPG driver SSA-applies the ObjectStore and patches `spec.plugins` onto the live Cluster at first BackupJob time.
 ## @field {string} [retentionPolicy] - Retention policy (e.g. "30d").
 ## @field {string} [destinationPath] - DEPRECATED. Per-tenant S3 configuration is superseded by the platform-managed `cozy-default` BackupClass and the `cozy-backups` system bucket. Leave empty for new installations; the BackupClass driver picks up the system-managed coordinates. Kept for in-place upgrade compatibility.
 ## @field {string} [endpointURL] - DEPRECATED. See `destinationPath`.

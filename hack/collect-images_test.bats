@@ -7,10 +7,13 @@
 # talosctl is a stub: it prints the `images ls` table held in
 # $MOCK_TALOS/<node>-<namespace>, or fails for a node listed in $MOCK_TALOS/down.
 #
-# Harness note: run by hack/cozytest.sh, not real bats; each @test is a shell
-# function under `set -eu`, sourced into POSIX sh (dash on CI).
+# Harness note: the unit lane runs this file under Bats. The bodies stay POSIX
+# sh (no `run`, no [[ ]]; each @test a shell function under `set -eu`), so
+# hack/cozytest.sh can still run it under dash by hand.
 #
-# Run with: hack/cozytest.sh hack/collect-images_test.bats
+# Run with: bats hack/collect-images_test.bats
+
+load test_helper
 
 _stub_talos() {
   MOCK_TALOS="$1"
@@ -85,6 +88,21 @@ D3="sha256:$(printf '3%.0s' $(seq 1 64))"
   [ "$(yq -r '.jobs.e2e.steps[] | select(.name == "Tear down sandbox") | .if' "$wf")" = 'always()' ]
   yq -r '.jobs.e2e.steps[] | select(.name == "Upload image list") | .with.path' "$wf" | grep -q 'image-refs.txt'
   yq -r '.jobs.e2e.steps[] | select(.name == "Upload image list") | .with.path' "$wf" | grep -q 'multiarch-audit.txt'
+}
+
+@test "e2e-tag refuses a tree that predates the container lane and names the ref to dispatch from" {
+  run=$(yq -r '.jobs.e2e.steps[] | select(.name == "Require a container-lane tree") | .run' .github/workflows/e2e-tag.yaml)
+  tmp=$(mktemp -d)
+  mkdir -p "$tmp/old" "$tmp/new/hack"
+  touch "$tmp/new/hack/e2e-compose.yaml"
+  printf '%s\n' "$run" >"$tmp/step.sh"
+  (cd "$tmp/new" && TAG=v1.7.0-alpha.3 bash -e "$tmp/step.sh")
+  rc=0
+  (cd "$tmp/old" && TAG=v1.6.3 bash -e "$tmp/step.sh") >"$tmp/out" 2>&1 || rc=$?
+  [ "$rc" -ne 0 ]
+  grep -qF '::error title=e2e-tag::v1.6.3 predates the container lane' "$tmp/out"
+  grep -qF -- '--ref v1.6.3' "$tmp/out"
+  rm -rf "$tmp"
 }
 
 @test "the e2e audit skips a tree that predates it and fails a pre-release tree that has it" {

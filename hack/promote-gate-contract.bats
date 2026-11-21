@@ -4,6 +4,8 @@
 # These tests intentionally pin executable/structural workflow lines, not prose:
 # a commented-out gate, label, or body note must never satisfy the contract.
 
+load test_helper
+
 REPO_ROOT="$(cd "$(dirname "${BATS_TEST_FILENAME:-$0}")/.." && pwd)"
 PROMOTE="$REPO_ROOT/.github/workflows/promote-rc.yaml"
 PULL_REQUESTS="$REPO_ROOT/.github/workflows/pull-requests.yaml"
@@ -251,6 +253,21 @@ code_lines() {
   # each later `git remote set-url` injects onto the tag pushes — and a
   # GITHUB_TOKEN-authenticated push creates no workflow run (anti-recursion), so
   # tags.yaml's stable-tag backstops never fire (v1.6.0's tag never triggered it).
+  count="$(printf '%s\n' "$checkout" | code_lines | grep -cF 'persist-credentials: false' || true)"
+  [ "${count:-0}" -eq 1 ]
+}
+
+@test "prepare-release checkout does not persist credentials so the staging-branch push carries the app token" {
+  block="$(job_block prepare-release "$TAGS")"
+  [ -n "$block" ]
+  checkout="$(printf '%s\n' "$block" | awk '
+    /^      - name: Checkout code$/ { inside = 1; next }
+    /^      - name: / { inside = 0 }
+    inside')"
+  [ -n "$checkout" ]
+
+  # actions/checkout v6+ writes the extraheader into a file it includes via
+  # includeIf, out of reach of a `git config --unset-all` on the repo config.
   count="$(printf '%s\n' "$checkout" | code_lines | grep -cF 'persist-credentials: false' || true)"
   [ "${count:-0}" -eq 1 ]
 }

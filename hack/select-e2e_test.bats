@@ -2,17 +2,19 @@
 # -----------------------------------------------------------------------------
 # Unit tests for hack/select-e2e.sh
 #
-# cozytest.sh's awk parser recognizes only @test blocks and a bare `}` on its
-# own line; there is no bats `run` or `$status`. Each test runs as a shell
-# function under `set -eu -x`, so assertions are direct shell tests that exit
-# non-zero on failure. setup()/teardown() are not honored — each test creates
-# and cleans its own scratch dir.
+# CI runs this file under Bats through `make bats-unit-tests`. It also remains
+# compatible with the legacy `hack/cozytest.sh` translator, whose awk parser
+# recognizes only @test blocks and a bare `}` on its own line. The tests avoid
+# `run`, `$status`, setup(), and teardown() for that compatibility path and use
+# direct shell assertions with inline fixture cleanup.
 #
 # Test-level EXIT traps replace Bats' own handler and hide failing TAP results.
 # Cleanup follows aborting assertions; see docs/agents/e2e-testing.md.
 #
-# Run with: hack/cozytest.sh hack/select-e2e_test.bats
+# Run with: bats hack/select-e2e_test.bats
 # -----------------------------------------------------------------------------
+
+load test_helper
 
 # Assert that a selection is the WHOLE suite list, not merely a long one.
 #
@@ -121,7 +123,7 @@ assert_full_suite() {
     rm -rf "$tmp"
 }
 
-@test "a CDI change selects the suite that exercises a VMDisk" {
+@test "a CDI change selects a closure that keeps VMDisk and CDI" {
     # kubevirt-cdi reaches vm-disk-application and nothing else runnable, so
     # until vm-disk-application mapped to a suite every CDI change ran all of
     # them. The vminstance suite creates a VMDisk and asserts the DataVolume
@@ -131,6 +133,9 @@ assert_full_suite() {
     echo "packages/system/kubevirt-cdi/values.yaml" > "$tmp/diff"
     output=$(hack/select-e2e.sh "$tmp/diff" "$tmp/sources")
     [ "$output" = "vminstance" ]
+    closure=$(hack/select-install.sh "$output" "$tmp/sources")
+    printf '%s\n' "$closure" | tr ' ' '\n' | grep -Fxq cozystack.vm-disk-application
+    printf '%s\n' "$closure" | tr ' ' '\n' | grep -Fxq cozystack.kubevirt-cdi
     rm -rf "$tmp"
 }
 
@@ -194,6 +199,23 @@ assert_full_suite() {
     echo "docs/README.md" > "$tmp/diff"
     output=$(hack/select-e2e.sh "$tmp/diff" "$tmp/sources")
     [ -z "$output" ]
+    rm -rf "$tmp"
+}
+
+@test "the CI-only tools select nothing and do not escalate the rest" {
+    tmp=$(mktemp -d)
+    cp -r packages/core/platform/sources "$tmp/sources"
+    printf '%s\n' cmd/backport-batch/report_test.go cmd/api-gate/main.go > "$tmp/diff"
+    output=$(hack/select-e2e.sh "$tmp/diff" "$tmp/sources")
+    [ -z "$output" ]
+    # Beside a package, the package alone decides the selection.
+    printf '%s\n' cmd/backport-batch/main.go packages/apps/postgres/values.yaml > "$tmp/diff"
+    output=$(hack/select-e2e.sh "$tmp/diff" "$tmp/sources")
+    assert_selection "a CI-only tool must not widen a package selection" "$output" "postgres"
+    # Any other cmd/ directory is a shipped binary and still escalates.
+    echo "cmd/cozystack-api/main.go" > "$tmp/diff"
+    output=$(hack/select-e2e.sh "$tmp/diff" "$tmp/sources" 2>/dev/null)
+    assert_full_suite "$output"
     rm -rf "$tmp"
 }
 
@@ -278,6 +300,46 @@ assert_full_suite() {
     output=$(hack/select-e2e.sh "$tmp/diff" "$tmp/sources")
     [ "$output" = "postgres" ]
     rm -rf "$tmp"
+}
+
+@test "redis backup harness edit selects the valkey suite that also runs it" {
+    # valkey-backup-roundtrip drives examples/backups/redis with
+    # APP_KIND=Valkey, so a change to that harness must run both suites.
+    tmp=$(mktemp -d)
+    cp -r packages/core/platform/sources "$tmp/sources"
+    echo "examples/backups/redis/00-helpers.sh" > "$tmp/diff"
+    output=$(hack/select-e2e.sh "$tmp/diff" "$tmp/sources")
+    [ "$output" = "redis valkey" ]
+    rm -rf "$tmp"
+}
+
+@test "a velero change selects the vminstance suite" {
+    tmp=$(mktemp -d)
+    cp -r packages/core/platform/sources "$tmp/sources"
+    echo "packages/system/velero/values.yaml" > "$tmp/diff"
+    output=$(hack/select-e2e.sh "$tmp/diff" "$tmp/sources")
+    rm -rf "$tmp"
+    case " $output " in *" vminstance "*) ;; *) echo "a velero change selected '$output'" >&2; exit 1 ;; esac
+}
+
+@test "vmi/vmdisk backup harness edit selects the vminstance suite" {
+    tmp=$(mktemp -d)
+    cp -r packages/core/platform/sources "$tmp/sources"
+    for f in examples/backups/vmi/run-all.sh examples/backups/vmdisk/run-all.sh; do
+        echo "$f" > "$tmp/diff"
+        output=$(hack/select-e2e.sh "$tmp/diff" "$tmp/sources")
+        [ "$output" = "vminstance" ]
+    done
+    rm -rf "$tmp"
+}
+
+@test "vmi restore-to-copy step, which the suite skips, selects nothing" {
+    tmp=$(mktemp -d)
+    cp -r packages/core/platform/sources "$tmp/sources"
+    echo "examples/backups/vmi/07-restore-to-copy.sh" > "$tmp/diff"
+    output=$(hack/select-e2e.sh "$tmp/diff" "$tmp/sources") || true
+    rm -rf "$tmp"
+    [ -z "$output" ]
 }
 
 @test "backup example without a matching suite selects nothing" {
@@ -479,7 +541,7 @@ assert_full_suite() {
     # escalated to the full run.
     tmp=$(mktemp -d)
     cp -r packages/core/platform/sources "$tmp/sources"
-    echo "hack/e2e-chainsaw/backup/chainsaw-test.yaml.disabled" > "$tmp/diff"
+    echo "hack/e2e-chainsaw/kubernetes-proxmox/chainsaw-test.yaml.disabled" > "$tmp/diff"
     output=$(hack/select-e2e.sh "$tmp/diff" "$tmp/sources")
     [ -z "$output" ]
     rm -rf "$tmp"
@@ -491,7 +553,7 @@ assert_full_suite() {
     # that would silently unselect real work committed in the same change.
     tmp=$(mktemp -d)
     cp -r packages/core/platform/sources "$tmp/sources"
-    printf '%s\n' hack/e2e-chainsaw/backup/chainsaw-test.yaml.disabled \
+    printf '%s\n' hack/e2e-chainsaw/kubernetes-proxmox/chainsaw-test.yaml.disabled \
         packages/apps/postgres/values.yaml > "$tmp/diff"
     output=$(hack/select-e2e.sh "$tmp/diff" "$tmp/sources")
     [ "$output" = "postgres" ]
@@ -528,6 +590,24 @@ assert_full_suite() {
     done
     # And an inert unit bats file beside a real app path must not mask it.
     printf '%s\n' hack/select-e2e_test.bats packages/apps/postgres/values.yaml > "$tmp/diff"
+    output=$(hack/select-e2e.sh "$tmp/diff" "$tmp/sources")
+    [ "$output" = "postgres" ]
+    rm -rf "$tmp"
+}
+
+@test "the shared unit Bats helper selects nothing" {
+    # test_helper.bash is loaded only by BATS_UNIT_FILES. Enumerate this exact
+    # helper as inert rather than matching hack/*.bash: a future production
+    # helper must still hit the unclassified fail-safe until someone decides
+    # which e2e lane exercises it.
+    tmp=$(mktemp -d)
+    cp -r packages/core/platform/sources "$tmp/sources"
+    echo "hack/test_helper.bash" > "$tmp/diff"
+    output=$(hack/select-e2e.sh "$tmp/diff" "$tmp/sources")
+    [ -z "$output" ]
+    # Inert means this path contributes nothing; it must not mask a real app
+    # path beside it.
+    printf '%s\n' hack/test_helper.bash packages/apps/postgres/values.yaml > "$tmp/diff"
     output=$(hack/select-e2e.sh "$tmp/diff" "$tmp/sources")
     [ "$output" = "postgres" ]
     rm -rf "$tmp"
@@ -1125,30 +1205,57 @@ assert_full_suite() {
     rm -rf "$tmp"
 }
 
-@test "every suite round-trips between the two mapping tables" {
+@test "every suite owner round-trips through selection and install closure" {
     # select-install.sh maps a suite to the PackageSource that installs it, and
     # select-e2e.sh must map that source back to the suite. A suite that does
-    # not round-trip is unreachable from its own package, so every change to it
-    # escalates to the full run — which is how the kuberture and securitygroup
-    # entries came to be missing in the first place. Pinning the property rather
-    # than those two names is what stops the next off-convention source
-    # repeating it silently.
+    # not round-trip is unreachable from its own package. Exercise the actual
+    # scripts as well as the two mapping functions so a full-suite fallback or
+    # a closure that happens to contain a baseline source cannot pass vacuously.
     eval "$(sed -n '/^src_to_suites()/,/^}/p' hack/select-e2e.sh)"
     eval "$(sed -n '/^suite_to_source()/,/^}/p' hack/select-install.sh)"
     # suite_to_source falls back to probing the graph for a source of that name,
     # and reads it from NODES, which its own script builds before calling it.
     NODES=$(yq -rN '.metadata.name' packages/core/platform/sources/*.yaml | sort -u)
+    tmp=$(mktemp -d)
     for suite in $(full_suite_list | tr ' ' '\n'); do
-        src=$(suite_to_source "$suite")
-        if [ -z "$src" ]; then
+        owners=$(suite_to_source "$suite")
+        if [ -z "$owners" ]; then
             echo "suite '$suite' has no source in select-install.sh's suite_to_source" >&2
             exit 1
         fi
-        if ! src_to_suites "${src#cozystack.}" | tr ' ' '\n' | grep -Fxq "$suite"; then
-            echo "suite '$suite' maps to $src, which select-e2e.sh maps back to '$(src_to_suites "${src#cozystack.}")'" >&2
-            exit 1
-        fi
+        for src in $owners; do
+            if ! src_to_suites "${src#cozystack.}" | tr ' ' '\n' | grep -Fxq "$suite"; then
+                echo "suite '$suite' maps to $src, which select-e2e.sh maps back to '$(src_to_suites "${src#cozystack.}")'" >&2
+                exit 1
+            fi
+
+            source_file="packages/core/platform/sources/${src#cozystack.}.yaml"
+            component_path=$(yq -r '.spec.variants[].components[]?.path | select(. != null)' "$source_file" | sed -n '1p')
+            component_path="packages/$component_path"
+            files=$(find "$component_path" -type f ! -name '*.md')
+            changed=$(printf '%s\n' "$files" | sort | sed -n '1p')
+            if [ -z "$changed" ]; then
+                echo "suite owner '$src' has no real component file for the selector matrix" >&2
+                exit 1
+            fi
+            printf '%s\n' "$changed" > "$tmp/diff"
+            selected=$(hack/select-e2e.sh "$tmp/diff")
+            if [ "$selected" = "$(full_suite_list)" ]; then
+                echo "owner '$src' reached '$suite' only through full-suite fallback for $changed" >&2
+                exit 1
+            fi
+            if ! printf '%s\n' "$selected" | tr ' ' '\n' | grep -Fxq "$suite"; then
+                echo "owner '$src' did not select its suite '$suite' for $changed: $selected" >&2
+                exit 1
+            fi
+            closure=$(hack/select-install.sh "$selected")
+            if ! printf '%s\n' "$closure" | tr ' ' '\n' | grep -Fxq "$src"; then
+                echo "selection '$selected' does not install owner '$src' for suite '$suite'" >&2
+                exit 1
+            fi
+        done
     done
+    rm -rf "$tmp"
 }
 
 @test "an edit to a non-suite directory under e2e-chainsaw escalates on its own account" {
